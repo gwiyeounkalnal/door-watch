@@ -1,0 +1,9 @@
+{
+  "name": "door-watch",
+  "version": "1.0.0",
+  "description": "카메라로 문이 밀리는지 당겨지는지 판단하고 기록하는 사이트",
+  "main": "server.js",
+  "scripts": { "start": "node server.js" },
+  "dependencies": { "express": "^4.19.2",
+    "selfsigned": "^2.4.1" }
+}

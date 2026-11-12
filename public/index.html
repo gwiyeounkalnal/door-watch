@@ -1,0 +1,283 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>밀당금지</title>
+<style>
+  :root{--bg:#f6f5f1;--fg:#1d1d1b;--card:#fff;--line:#ddd9cf;--push:#c2410c;--pull:#0f766e;--mut:#77746b}
+  @media (prefers-color-scheme:dark){:root{--bg:#16161a;--fg:#ececea;--card:#202026;--line:#33333b;--push:#fb923c;--pull:#2dd4bf;--mut:#9a98a0}}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.5 system-ui,-apple-system,"Noto Sans KR",sans-serif}
+  h1{margin:16px 16px 0;max-width:1200px;margin-inline:auto;padding-inline:16px;font-size:24px}
+  main{display:grid;grid-template-columns:minmax(0,2fr) minmax(280px,1fr);gap:16px;padding:16px;max-width:1200px;margin:auto}
+  @media(max-width:800px){main{grid-template-columns:1fr}}
+  .cam{position:relative;background:#000;border-radius:12px;overflow:hidden;aspect-ratio:4/3}
+  video,canvas#ov{position:absolute;inset:0;width:100%;height:100%;object-fit:fill}
+  canvas#ov{cursor:crosshair;touch-action:none}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:16px;margin-bottom:12px}
+  #result{font-size:44px;font-weight:700;text-align:center;padding:12px 0}
+  #result.push{color:var(--push)}#result.pull{color:var(--pull)}
+  #status{color:var(--mut);text-align:center;font-size:13px;min-height:20px}
+  .btns{display:flex;flex-wrap:wrap;gap:8px;margin-top:12px}
+  button{flex:1;padding:9px 10px;border:1px solid var(--line);background:var(--bg);color:var(--fg);border-radius:8px;font:inherit;cursor:pointer}
+  button.on{background:var(--fg);color:var(--bg)}
+  h3{margin:0 0 8px;font-size:15px}
+  ul{list-style:none;margin:0;padding:0;max-height:320px;overflow:auto}
+  li{display:flex;align-items:center;gap:8px;padding:6px 0;border-bottom:1px solid var(--line);font-size:13px}
+  li b.push{color:var(--push)}li b.pull{color:var(--pull)}
+  li a{margin-left:auto;color:var(--mut)}
+  small{color:var(--mut)}
+</style>
+</head>
+<body>
+<h1>밀당금지</h1>
+<main>
+  <section>
+    <div class="cam"><video id="v" autoplay playsinline muted></video><canvas id="ov"></canvas></div>
+    <small>화면에서 문 영역을 마우스로 드래그해 지정하세요. (https:// 로 접속해야 카메라가 켜집니다)</small>
+  </section>
+  <aside>
+    <div class="card">
+      <div id="result">대기 중</div>
+      <div id="status">카메라 시작 중…</div>
+      <div class="btns">
+        <button id="lPull">당기기 학습</button>
+        <button id="lPush">밀기 학습</button>
+        <button id="fix" disabled>방금 판정 정정</button>
+        <button id="flip">전·후면 전환</button>
+        <button id="lPerson">사람 지나감 학습</button>
+        <button id="fp" disabled>사람이었음(취소)</button>
+        <button id="rLearn">학습 리셋</button>
+        <button id="rCount">횟수 리셋</button>
+      </div>
+      <label style="display:block;margin-top:12px;font-size:13px">최소 움직임 면적 <b id="covv"></b>%
+        <input id="cov" type="range" min="0" max="60" style="width:100%"></label>
+      <p><small>처음 한 번: ‘당기기 학습’을 누르고 문을 당겨 열기 → ‘밀기 학습’을 누르고 문을 밀어 열기. 이후 자동 판정됩니다. 사람이 문 앞을 지나다니는 환경이면 ‘사람 지나감 학습’으로 지나가는 동작도 한두 번 보여 주고, 최소 움직임 면적을 올려 보세요. 판정이 틀리면 정정 버튼으로 학습을 보정할 수 있습니다.</small></p>
+    </div>
+    <div class="card"><h3>기록 (records 폴더에 저장)</h3><ul id="log"></ul></div>
+  </aside>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+const W = 64, H = 48, B = 8, R = 3, ACT_BLOCKS = 3, QUIET_FRAMES = 8, MIN_MOTION = 20;
+const v = $('v'), ov = $('ov'), oc = ov.getContext('2d');
+const work = document.createElement('canvas'); work.width = W; work.height = H;
+const wc = work.getContext('2d', { willReadFrequently: true });
+const KR = { push: '밀기', pull: '당기기', person: '사람 지나감' };
+const LBTN = { pull: 'lPull', push: 'lPush', person: 'lPerson' };
+let minCover = parseFloat(localStorage.getItem('minCover') || '15');   // 최소 움직임 면적(%)
+
+let roi = { x: .2, y: .1, w: .6, h: .8 };   // 0~1 정규화
+let prev = null, ev = null, quiet = 0, learn = null, last = null, samples = [];
+let proto = {};
+try { proto = JSON.parse(localStorage.getItem('doorProto') || '{}'); } catch (e) {}
+
+const gray = () => {
+  wc.drawImage(v, 0, 0, W, H);
+  const d = wc.getImageData(0, 0, W, H).data, g = new Uint8Array(W * H);
+  for (let i = 0; i < g.length; i++) g[i] = (d[i*4]*77 + d[i*4+1]*150 + d[i*4+2]*29) >> 8;
+  return g;
+};
+
+// 블록 매칭 광류: ROI 안에서 움직이는 블록의 이동 벡터를 구해 특징값 계산
+function flow(a, b) {
+  const s = [];
+  const bx0 = Math.max(Math.ceil(R / B), Math.floor(roi.x * W / B));
+  const bx1 = Math.min(Math.floor((W - R) / B) - 1, Math.ceil((roi.x + roi.w) * W / B) - 1);
+  const by0 = Math.max(Math.ceil(R / B), Math.floor(roi.y * H / B));
+  const by1 = Math.min(Math.floor((H - R) / B) - 1, Math.ceil((roi.y + roi.h) * H / B) - 1);
+  const sad = (x, y, dx, dy) => {
+    let t = 0;
+    for (let j = 0; j < B; j++) for (let i = 0; i < B; i++)
+      t += Math.abs(b[(y+j)*W + x+i] - a[(y+j+dy)*W + x+i+dx]);
+    return t;
+  };
+  for (let by = by0; by <= by1; by++) for (let bx = bx0; bx <= bx1; bx++) {
+    const x = bx * B, y = by * B;
+    const s0 = sad(x, y, 0, 0);
+    if (s0 < 6 * B * B) continue;               // 움직임 없는 블록
+    let best = s0, bdx = 0, bdy = 0;
+    for (let dy = -R; dy <= R; dy++) for (let dx = -R; dx <= R; dx++) {
+      const c = sad(x, y, dx, dy);
+      if (c < best) { best = c; bdx = dx; bdy = dy; }
+    }
+    s.push({ cx: x + B/2, cy: y + B/2, mx: -bdx, my: -bdy });
+  }
+  samples = s;
+  if (s.length < ACT_BLOCKS) return null;
+  const n = s.length, avg = k => s.reduce((t, p) => t + p[k], 0) / n;
+  const mx = avg('mx'), my = avg('my'), cx = avg('cx'), cy = avg('cy');
+  const dvx = s.reduce((t, p) => t + (p.cx - cx) * (p.mx - mx), 0) / n;  // 가로 확대/축소
+  const dvy = s.reduce((t, p) => t + (p.cy - cy) * (p.my - my), 0) / n;  // 세로 확대/축소
+  return { n, total: (bx1 - bx0 + 1) * (by1 - by0 + 1), f: [mx, my, dvx / 8, dvy / 8] };
+}
+
+const unit = f => { const m = Math.hypot(...f) || 1; return f.map(x => x / m); };
+const dot = (a, b) => a.reduce((t, x, i) => t + x * b[i], 0);
+
+function classify(vec) {
+  if (!proto.push || !proto.pull) return null;
+  const u = unit(vec), sp = dot(u, proto.pull), ss = dot(u, proto.push);
+  const sx = proto.person ? dot(u, proto.person) : -1;
+  const best = Math.max(sp, ss);
+  if (sx > best || best < 0.5) return { direction: 'ignore' };   // 사람이거나 문과 닮지 않은 움직임
+  return { direction: sp >= ss ? 'pull' : 'push', confidence: Math.round(50 + 50 * Math.min(1, Math.abs(sp - ss))) };
+}
+
+function learnProto(label, vec) {
+  const u = unit(vec), p = proto[label];
+  proto[label] = p ? unit(p.map((x, i) => x + u[i])) : u;
+  localStorage.setItem('doorProto', JSON.stringify(proto));
+}
+
+function snapshot() {
+  const c = document.createElement('canvas'); c.width = v.videoWidth; c.height = v.videoHeight;
+  c.getContext('2d').drawImage(v, 0, 0); return c.toDataURL('image/jpeg', .7);
+}
+
+async function save(direction, confidence, corrected) {
+  await fetch('/api/records', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ direction, confidence, corrected, snapshot: snapshot() }) });
+  loadLog();
+}
+
+function show(direction, confidence) {
+  const r = $('result'); r.className = direction; r.textContent = KR[direction];
+  $('status').textContent = `신뢰도 ${confidence}% · ${new Date().toLocaleTimeString()}`;
+}
+
+async function finish() {
+  const vec = ev.sum.map(x => x / ev.n), cover = ev.n / ev.frames / ev.total * 100;
+  ev = null;
+  if (learn) {
+    learnProto(learn, vec);
+    $('result').className = learn === 'person' ? '' : learn; $('result').textContent = KR[learn];
+    $('status').textContent = `${KR[learn]} 동작을 학습했습니다.`;
+    $(LBTN[learn]).classList.remove('on'); learn = null; return;
+  }
+  if (cover < minCover) { $('status').textContent = `무시: 움직인 면적이 작음 (${Math.round(cover)}% < ${minCover}%)`; return; }
+  const c = classify(vec);
+  if (!c) { $('status').textContent = '먼저 당기기/밀기를 각각 학습시켜 주세요.'; return; }
+  if (c.direction === 'ignore') { $('status').textContent = '문 움직임이 아니라고 판단해 무시했습니다.'; return; }
+  last = { vec, ...c };
+  $('fix').disabled = false; $('fp').disabled = false;
+  show(c.direction, c.confidence);
+  save(c.direction, c.confidence, false);
+}
+
+function step() {
+  if (v.readyState >= 2) {
+    const g = gray();
+    if (prev) {
+      const r = flow(prev, g);
+      if (r) {
+        quiet = 0;
+        if (!ev) { ev = { sum: [0,0,0,0], n: 0, frames: 0, total: r.total }; $('status').textContent = '움직임 감지 중…'; }
+        r.f.forEach((x, i) => ev.sum[i] += x * r.n); ev.n += r.n; ev.frames++;
+      } else if (ev && ++quiet > QUIET_FRAMES) {
+        ev.frames >= 4 && ev.n >= MIN_MOTION ? finish() : (ev = null);
+      }
+    }
+    prev = g; draw();
+  }
+  setTimeout(step, 66);
+}
+
+function draw() {
+  oc.clearRect(0, 0, ov.width, ov.height);
+  const sx = ov.width / W, sy = ov.height / H;
+  oc.strokeStyle = '#fff'; oc.lineWidth = 2; oc.setLineDash([6, 4]);
+  oc.strokeRect(roi.x * ov.width, roi.y * ov.height, roi.w * ov.width, roi.h * ov.height);
+  oc.setLineDash([]); oc.strokeStyle = '#fbbf24';
+  samples.forEach(p => { oc.beginPath(); oc.moveTo(p.cx*sx, p.cy*sy); oc.lineTo((p.cx+p.mx*3)*sx, (p.cy+p.my*3)*sy); oc.stroke(); });
+}
+
+// ROI 드래그
+let drag = null;
+const pos = e => { const r = ov.getBoundingClientRect(); return { x: (e.clientX - r.left) / r.width, y: (e.clientY - r.top) / r.height }; };
+ov.onpointerdown = e => { drag = pos(e); ov.setPointerCapture(e.pointerId); };
+ov.onpointermove = e => {
+  if (!drag) return; const p = pos(e);
+  roi = { x: Math.max(0, Math.min(drag.x, p.x)), y: Math.max(0, Math.min(drag.y, p.y)),
+          w: Math.min(1, Math.abs(p.x - drag.x)), h: Math.min(1, Math.abs(p.y - drag.y)) };
+};
+ov.onpointerup = () => { drag = null; };
+
+// 버튼
+const setLearn = l => {
+  learn = learn === l ? null : l;
+  Object.keys(LBTN).forEach(k => $(LBTN[k]).classList.toggle('on', learn === k));
+  $('status').textContent = learn ? `${KR[learn]} 동작을 해주세요…` : '';
+};
+$('lPull').onclick = () => setLearn('pull');
+$('lPush').onclick = () => setLearn('push');
+$('lPerson').onclick = () => setLearn('person');
+$('fp').onclick = async () => {
+  if (!last) return;
+  learnProto('person', last.vec);
+  await fetch('/api/records/undo', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ direction: last.direction }) });
+  last = null; $('fp').disabled = true; $('fix').disabled = true;
+  $('result').className = ''; $('result').textContent = '대기 중';
+  $('status').textContent = '사람으로 학습하고 방금 횟수를 취소했습니다.'; loadLog();
+};
+$('cov').value = minCover; $('covv').textContent = minCover;
+$('cov').oninput = e => { minCover = +e.target.value; $('covv').textContent = minCover; localStorage.setItem('minCover', minCover); };
+$('fix').onclick = () => {
+  if (!last) return;
+  $('fp').disabled = true;
+  const d = last.direction === 'pull' ? 'push' : 'pull';
+  learnProto(d, last.vec); last.direction = d; show(d, 100); save(d, 100, true); $('fix').disabled = true;
+};
+
+$('rLearn').onclick = () => {
+  if (!confirm('학습한 당기기/밀기 데이터를 모두 지울까요?')) return;
+  proto = {}; last = null; learn = null; localStorage.removeItem('doorProto');
+  $('lPull').classList.remove('on'); $('lPush').classList.remove('on'); $('fix').disabled = true; $('fp').disabled = true; $('lPerson').classList.remove('on');
+  $('result').className = ''; $('result').textContent = '대기 중';
+  $('status').textContent = '학습이 초기화되었습니다. 당기기/밀기를 다시 학습시켜 주세요.';
+};
+$('rCount').onclick = async () => {
+  if (!confirm('당김/밀기 횟수를 0으로 되돌릴까요?')) return;
+  await fetch('/api/counts/reset', { method: 'POST' });
+  loadCounts();
+};
+
+async function loadCounts() {
+  const c = await (await fetch('/api/counts')).json();
+  $('counts').innerHTML = `당김 <span style="color:var(--pull)">${c.pull}</span>회 · 밀기 <span style="color:var(--push)">${c.push}</span>회`;
+}
+async function loadLog() {
+  loadCounts();
+  const rows = await (await fetch('/api/records')).json();
+  $('log').innerHTML = rows.map(r => r.falsePositive ? `<li><small>↩ ${KR[r.direction]} 취소(오탐)</small><small style="margin-left:auto">${new Date(r.time).toLocaleString()}</small></li>` : `<li><b class="${r.direction}">${KR[r.direction]}</b>
+    <span>${new Date(r.time).toLocaleString()}</span><small>${r.confidence}%${r.corrected ? ' · 정정' : ''}</small>
+    ${r.image ? `<a href="/snapshots/${r.image}" target="_blank">사진</a>` : ''}</li>`).join('') || '<li>아직 기록 없음</li>';
+}
+
+let facing = 'environment';   // 기본: 후방 카메라
+async function startCam() {
+  if (!navigator.mediaDevices) throw new Error('https:// 주소로 접속해야 카메라를 쓸 수 있습니다.');
+  if (v.srcObject) v.srcObject.getTracks().forEach(t => t.stop());
+  v.srcObject = await navigator.mediaDevices.getUserMedia({
+    video: { facingMode: { ideal: facing }, width: { ideal: 640 }, height: { ideal: 480 } }
+  });
+  await v.play(); ov.width = v.videoWidth; ov.height = v.videoHeight; prev = null; ev = null;
+}
+$('flip').onclick = async () => {
+  facing = facing === 'environment' ? 'user' : 'environment';
+  try { await startCam(); $('status').textContent = facing === 'environment' ? '후방 카메라' : '전면 카메라'; }
+  catch (e) { $('status').textContent = '카메라 전환 실패: ' + e.message; }
+};
+
+(async () => {
+  loadLog();
+  try {
+    await startCam();
+    $('status').textContent = proto.push && proto.pull ? '문을 지켜보는 중…' : '먼저 당기기/밀기를 학습시켜 주세요.';
+    step();
+  } catch (e) { $('status').textContent = '카메라를 사용할 수 없습니다: ' + e.message; }
+})();
+</script>
+</body>
+</html>
